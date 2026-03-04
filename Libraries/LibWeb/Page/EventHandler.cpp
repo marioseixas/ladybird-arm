@@ -733,6 +733,9 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
                 //        then step 8 of this algorithm needs to be implemented in Navigable::choose_a_navigable:
                 //        https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
 
+                // NOTE: Event dispatches above may have run JS that invalidated layout.
+                m_navigable->active_document()->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseUp);
+
                 auto top_level_viewport_position = m_navigable->to_top_level_position(viewport_position);
                 if (GC::Ptr<HTML::HTMLAnchorElement const> link = node->enclosing_link_element()) {
                     GC::Ref<DOM::Document> document = *m_navigable->active_document();
@@ -771,14 +774,16 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
                         }
                     } else if (is<HTML::HTMLMediaElement>(*context_menu_node)) {
                         auto& media_element = as<HTML::HTMLMediaElement>(*context_menu_node);
+                        auto is_video = is<HTML::HTMLVideoElement>(*context_menu_node);
 
                         Page::MediaContextMenu menu {
                             .media_url = *media_element.document().encoding_parse_url(media_element.current_src()),
-                            .is_video = is<HTML::HTMLVideoElement>(*context_menu_node),
+                            .is_video = is_video,
                             .is_playing = media_element.potentially_playing(),
                             .is_muted = media_element.muted(),
                             .has_user_agent_controls = media_element.has_attribute(HTML::AttributeNames::controls),
                             .is_looping = media_element.has_attribute(HTML::AttributeNames::loop),
+                            .is_fullscreen = is_video && media_element.is_fullscreen_element(),
                         };
 
                         m_navigable->page().did_request_media_context_menu(media_element.unique_id(), top_level_viewport_position, "", modifiers, menu);

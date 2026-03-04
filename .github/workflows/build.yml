@@ -1,4 +1,4 @@
-name: Build Ladybird (AppImage)
+name: Build Ladybird Portable (Arch AUR Hardened)
 
 on:
   push:
@@ -20,9 +20,9 @@ jobs:
       image: archlinux:latest
 
     steps:
-      # ----------------------------
+      # -------------------------------------------------
       # BASE SYSTEM
-      # ----------------------------
+      # -------------------------------------------------
       - name: Initialize Arch Linux
         run: |
           pacman -Syu --noconfirm
@@ -43,122 +43,136 @@ jobs:
             nasm \
             unzip \
             zip \
-            patchelf \
-            wget \
-            imagemagick
+            patchelf
 
-      # ----------------------------
+      # -------------------------------------------------
       # BUILDER USER
-      # ----------------------------
+      # -------------------------------------------------
       - name: Create builder user
         run: |
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-      # ----------------------------
-      # FIX WORKSPACE PERMISSIONS
-      # ----------------------------
-      - name: Fix workspace ownership
+      # -------------------------------------------------
+      # CLONE AUR
+      # -------------------------------------------------
+      - name: Clone Ladybird AUR
         run: |
-          chown -R builder:builder "$GITHUB_WORKSPACE"
+          sudo -u builder git clone https://aur.archlinux.org/ladybird.git /home/builder/ladybird
 
-      # ----------------------------
-      # FETCH AUR PKGBUILD
-      # ----------------------------
-      - name: Clone Ladybird AUR repo
-        run: |
-          sudo -u builder git clone https://aur.archlinux.org/ladybird.git
-
-      # ----------------------------
+      # -------------------------------------------------
       # BUILD PACKAGE
-      # ----------------------------
+      # -------------------------------------------------
       - name: Build Ladybird from AUR
         run: |
-          cd ladybird
+          cd /home/builder/ladybird
           sudo -u builder env MAKEFLAGS="-j$(nproc)" makepkg -s --noconfirm
 
-      # ----------------------------
-      # PREPARE AppDir
-      # ----------------------------
-      - name: Prepare AppDir
+      # -------------------------------------------------
+      # CREATE PORTABLE BUNDLE
+      # -------------------------------------------------
+      - name: Create portable bundle
         run: |
           set -e
 
-          BINARY=$(find ladybird/pkg -type f -name 'Ladybird')
-          echo "Found binary: $BINARY"
+          PKG_DIR=$(find /home/builder/ladybird/pkg -type d -name "usr")
+          BIN_SOURCE="$PKG_DIR/bin"
 
-          APPDIR=ladybird/AppDir
-          mkdir -p "$APPDIR/usr/bin"
-          cp "$BINARY" "$APPDIR/usr/bin/"
+          PORTABLE=/home/builder/Ladybird-portable
+          mkdir -p "$PORTABLE/bin"
+          mkdir -p "$PORTABLE/lib"
+          mkdir -p "$PORTABLE/plugins"
 
-          # Bundle Qt6 plugins safely (Qt6 layout on Arch)
-          mkdir -p "$APPDIR/usr/lib/qt6/plugins"
-
-          for dir in platforms multimedia imageformats; do
-            if [ -d "/usr/lib/qt6/plugins/$dir" ]; then
-              echo "Copying Qt6 plugin directory: $dir"
-              cp -r "/usr/lib/qt6/plugins/$dir" "$APPDIR/usr/lib/qt6/plugins/"
-            else
-              echo "Skipping missing plugin dir: $dir"
+          echo "Copying Ladybird executables..."
+          for file in "$BIN_SOURCE"/*; do
+            if file "$file" | grep -q ELF; then
+              cp "$file" "$PORTABLE/bin/"
             fi
           done
 
-          # Create desktop entry
-          mkdir -p "$APPDIR/usr/share/applications"
+          MAIN_BINARY="$PORTABLE/bin/Ladybird"
 
-          echo "[Desktop Entry]" > "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Type=Application" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Name=Ladybird" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Exec=Ladybird" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Icon=ladybird" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Comment=Ladybird web browser" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Categories=Network;WebBrowser;" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
-          echo "Terminal=false" >> "$APPDIR/usr/share/applications/Ladybird.desktop"
+          echo "Copying runtime shared libraries..."
+          ldd "$MAIN_BINARY" | awk '{print $3}' | grep '^/' | while read lib; do
+            case "$lib" in
+              */ld-linux*|*/libc.so*|*/libm.so*|*/libpthread.so*|*/librt.so*|*/libdl.so*)
+                echo "Skipping core libc: $lib"
+                ;;
+              *)
+                cp -v "$lib" "$PORTABLE/lib/"
+                ;;
+            esac
+          done
 
-          # Create placeholder icon (prevents AppImage build failure)
-          mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-          convert -size 256x256 xc:none \
-            "$APPDIR/usr/share/icons/hicolor/256x256/apps/ladybird.png" || true
+          echo "Copying Qt6 libraries..."
+          for lib in /usr/lib/libQt6*.so*; do
+            [ -f "$lib" ] && cp -v "$lib" "$PORTABLE/lib/"
+          done
 
-      # ----------------------------
-      # DOWNLOAD linuxdeployqt
-      # ----------------------------
-      - name: Download linuxdeployqt
-        run: |
-          wget -O linuxdeployqt.AppImage \
-            https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage
-          chmod +x linuxdeployqt.AppImage
+          echo "Copying Qt6 plugins..."
+          PLUGIN_DIRS=(
+            platforms
+            imageformats
+            iconengines
+            styles
+            mediaservice
+            audio
+            printsupport
+            accessible
+          )
 
-      # ----------------------------
-      # CREATE AppImage (No FUSE)
-      # ----------------------------
-      - name: Create AppImage
-        run: |
-          set -e
+          for dir in "${PLUGIN_DIRS[@]}"; do
+            SRC="/usr/lib/qt6/plugins/$dir"
+            DEST="$PORTABLE/plugins/$dir"
+            if [ -d "$SRC" ]; then
+              mkdir -p "$DEST"
+              cp -r "$SRC"/* "$DEST/"
+            fi
+          done
 
+          echo "Patching RPATH on all executables..."
+          for bin in "$PORTABLE/bin/"*; do
+            if file "$bin" | grep -q ELF; then
+              patchelf --set-rpath '$ORIGIN/../lib' "$bin"
+            fi
+          done
+
+          echo "Creating launcher..."
+          cat > "$PORTABLE/Ladybird.sh" << 'EOF'
+          #!/usr/bin/env bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$DIR/lib"
+          export QT_PLUGIN_PATH="$DIR/plugins"
           export QT_QPA_PLATFORM=xcb
 
-          # Extract linuxdeployqt (avoid FUSE requirement)
-          ./linuxdeployqt.AppImage --appimage-extract
-          
-          # Run extracted AppRun binary
-          ./squashfs-root/AppRun \
-            ladybird/AppDir/usr/share/applications/Ladybird.desktop \
-            -appimage
-      # ----------------------------
+          exec "$DIR/bin/Ladybird" "$@"
+          EOF
+
+          chmod +x "$PORTABLE/Ladybird.sh"
+
+      # -------------------------------------------------
+      # PACKAGE ZIP
+      # -------------------------------------------------
+      - name: Package portable zip
+        run: |
+          cd /home/builder
+          zip -r "$GITHUB_WORKSPACE/ladybird-portable-linux.zip" Ladybird-portable
+
+      # -------------------------------------------------
       # UPLOAD ARTIFACT
-      # ----------------------------
-      - name: Upload AppImage artifact
+      # -------------------------------------------------
+      - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ladybird-appimage
-          path: "ladybird/AppDir/*.AppImage"
+          name: ladybird-portable-linux
+          path: ladybird-portable-linux.zip
 
-      # ----------------------------
+      # -------------------------------------------------
       # RELEASE (TAGS ONLY)
-      # ----------------------------
+      # -------------------------------------------------
       - name: Upload to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ladybird/AppDir/*.AppImage
+          files: ladybird-portable-linux.zip
